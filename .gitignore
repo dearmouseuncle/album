@@ -13,3 +13,5 @@ del_broken.py
 delete_dupes.py
 find_dupes.py
 find_qr.py
+demo_media/
+screenshots/
