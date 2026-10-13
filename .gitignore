@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+config.json
+thumbs/
+trash/
+album.pid
+dupes.json
+dist/
+build/
+*.spec
+_test/
