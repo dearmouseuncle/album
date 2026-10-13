@@ -1,9 +1,11 @@
-# album.py — 相册管理器：多目录订阅 + 缩略图 + Web UI + 快速清理
-# 运行: 双击 启动.bat  或  python album.py
+# 小象相册 — 本地照片/视频管理器
+# 核心能力：多目录订阅、缩略图缓存、Web UI、快速清理、回收站删除
+# 运行: 双击 启动.bat / 小象相册.exe / python album.py
 # 依赖: Pillow, pillow-heif  (视频缩略图可选 ffmpeg)
-import http.server, json, os, re, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
+import http.server, json, os, re, shutil, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser
 from pathlib import Path
 
+# HEIC/HEIF 支持（iPhone 照片）
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
@@ -11,25 +13,29 @@ except ImportError:
     pass
 
 from PIL import Image, ImageOps
+Image.MAX_IMAGE_PIXELS = 2**31  # 允许超高分辨率全景图，防炸弹限制不全关
 
-# 数据目录：exe/脚本旁边，thumbs/ trash/ config.json 都放这里
+# ── 路径配置 ──────────────────────────────────────────────
+# 数据目录 = exe/脚本所在目录，thumbs/ trash/ config.json 都放这里
 if getattr(sys, "frozen", False):
     BASE = Path(sys.executable).resolve().parent
 else:
     BASE = Path(__file__).resolve().parent
 DATA = BASE
-THUMBS = DATA / "thumbs"
-TRASH = DATA / "trash"
-CONFIG = DATA / "config.json"
-PORT = 18899
+THUMBS = DATA / "thumbs"       # 缩略图缓存
+TRASH = DATA / "trash"         # 回收站（删除的文件移到这里）
+CONFIG = DATA / "config.json"  # 订阅目录配置
 
+# ffmpeg 路径：优先本机，找不到走 PATH
 FFMPEG = r"D:/whisper/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe"
 if not os.path.exists(FFMPEG):
     FFMPEG = "ffmpeg"
 
+# ── 常量 ──────────────────────────────────────────────────
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".tif", ".tiff"}
 VID_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
-THUMB_SIZE = (400, 300)
+THUMB_SIZE = (280, 210)  # 缩略图目标尺寸
+THUMB_QUALITY = 55       # JPEG 质量，平衡体积和速度
 
 MIME_MAP = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -39,13 +45,17 @@ MIME_MAP = {
     ".avi": "video/x-msvideo", ".mkv": "video/x-matroska", ".webm": "video/webm",
 }
 
-media_list = []
-media_lock = threading.Lock()
-thumb_sem = threading.Semaphore(4)
+# ── 全局状态 ──────────────────────────────────────────────
+media_list = []                              # 扫描到的媒体文件索引
+media_lock = threading.Lock()                # media_list 读写锁
+thumb_sem = threading.Semaphore(8)           # 缩略图并发生成限流
+config = {}                                  # 当前配置
+PORT = 18899
 
 
+# ── 配置读写 ──────────────────────────────────────────────
 def load_config():
-    """读 config.json，没有就建默认"""
+    """读 config.json，不存在或损坏时返回默认"""
     if CONFIG.exists():
         try:
             return json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -55,6 +65,7 @@ def load_config():
 
 
 def save_config(cfg):
+    """保存配置到 config.json"""
     CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -63,8 +74,13 @@ if config.get("port"):
     PORT = int(config["port"])
 
 
+# ── 路径解析 ──────────────────────────────────────────────
 def resolve_rel(rel):
-    """rel = '0/path/file.jpg' → (根目录Path, 根内相对路径str)，无效返回 (None, None)"""
+    """rel 格式 'sid/相对路径' → (根目录Path, 根内路径str)，无效返回 (None, None)
+
+    sid 是订阅目录在 config.dirs 中的索引，例如 '0/iPhone/photo.jpg'
+    表示 config.dirs[0] 下的 iPhone/photo.jpg
+    """
     sid_str, _, local = rel.partition("/")
     try:
         sid = int(sid_str)
@@ -76,26 +92,16 @@ def resolve_rel(rel):
     return Path(dirs[sid]), local
 
 
-def pregen_thumbs():
-    time.sleep(2)
-    items = sorted(media_list, key=lambda m: m["size"], reverse=True)
-    done = 0
-    for m in items:
-        thumb = THUMBS / (m["rel"] + ".jpg")
-        if thumb.exists():
-            continue
-        with thumb_sem:
-            ensure_thumb(m["rel"], m["is_video"])
-        done += 1
-        if done % 50 == 0:
-            print(f"  预生成缩略图 {done}...")
-    print(f"  预生成完成 {done} 个")
-
-
+# ── 日期解析 ──────────────────────────────────────────────
+# 从文件名提取拍摄日期，兼容常见手机命名：
+#   VID_20231218_222504.mp4  →  2023-12
+#   2023-07-08 221750.mov    →  2023-07
+#   Screenshot_2022-01-02-xx →  2022-01
 _DATE_PAT = re.compile(r"(\d{4})(\d{2})(\d{2})[_\s-]?\d{0,6}|(\d{4})-(\d{2})-(\d{2})")
 
 
 def parse_date(name, mtime):
+    """返回 (year, month)：优先文件名，兜底 mtime"""
     m = _DATE_PAT.search(name)
     if m:
         y = int(m.group(1) or m.group(4))
@@ -106,8 +112,13 @@ def parse_date(name, mtime):
     return t.tm_year, t.tm_mon
 
 
+# ── 媒体扫描 ──────────────────────────────────────────────
 def scan_media():
-    """扫描所有订阅目录，rel 统一带 sid 前缀"""
+    """遍历所有订阅目录，返回媒体文件索引列表（按 mtime 降序）
+
+    每个条目包含 rel（全局唯一路径）、sid（来源目录索引）、
+    name/size/mtime/is_video/year/month。
+    """
     items = []
     for sid, d in enumerate(config.get("dirs", [])):
         root = Path(d)
@@ -115,34 +126,41 @@ def scan_media():
             print(f"  跳过不存在的目录: {d}")
             continue
         print(f"  扫描 [{sid}] {d} ...")
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            ext = p.suffix.lower()
-            if ext not in IMG_EXT | VID_EXT:
-                continue
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            local = str(p.relative_to(root)).replace("\\", "/")
-            rel = f"{sid}/{local}"
-            year, month = parse_date(p.name, st.st_mtime)
-            items.append({
-                "rel": rel,
-                "sid": sid,
-                "name": p.name,
-                "size": st.st_size,
-                "mtime": st.st_mtime,
-                "is_video": ext in VID_EXT,
-                "year": year,
-                "month": month,
-            })
+        root_s = str(root)
+        for dirpath, _, filenames in os.walk(root_s):
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in IMG_EXT | VID_EXT:
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                local = os.path.relpath(fp, root_s).replace("\\", "/")
+                rel = f"{sid}/{local}"
+                year, month = parse_date(fn, st.st_mtime)
+                items.append({
+                    "rel": rel,
+                    "sid": sid,
+                    "name": fn,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "is_video": ext in VID_EXT,
+                    "year": year,
+                    "month": month,
+                })
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items
 
 
+# ── 缩略图 ────────────────────────────────────────────────
 def ensure_thumb(rel, is_video):
+    """生成并缓存缩略图，返回 Path 或 None
+
+    图片直接用 Pillow 缩放；视频用 ffmpeg 抽帧再缩放。
+    路径: thumbs/{rel}.jpg  （rel 含 sid 前缀，天然隔离多目录）
+    """
     root, local = resolve_rel(rel)
     if root is None:
         return None
@@ -154,30 +172,90 @@ def ensure_thumb(rel, is_video):
     try:
         if is_video:
             tmp = thumb.with_name(thumb.name + ".tmp.jpg")
-            r = subprocess.run([FFMPEG, "-i", str(src), "-ss", "1", "-vframes", "1", "-y", str(tmp)],
-                               capture_output=True, timeout=30)
+            subprocess.run(
+                [FFMPEG, "-i", str(src), "-ss", "0", "-vframes", "1", "-y", str(tmp)],
+                capture_output=True, timeout=30,
+            )
             if not tmp.exists():
                 return None
             img = Image.open(tmp)
             img = ImageOps.exif_transpose(img)
             img.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
-            img.convert("RGB").save(thumb, "JPEG", quality=85)
+            img.convert("RGB").save(thumb, "JPEG", quality=THUMB_QUALITY)
             tmp.unlink()
         else:
             img = Image.open(src)
             img = ImageOps.exif_transpose(img)
             img.thumbnail(THUMB_SIZE, Image.Resampling.LANCZOS)
-            img.convert("RGB").save(thumb, "JPEG", quality=85)
+            img.convert("RGB").save(thumb, "JPEG", quality=THUMB_QUALITY)
         return thumb
     except Exception as e:
         print(f"  缩略图失败 {rel}: {e}")
         return None
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
+def pregen_thumbs(limit=400):
+    """预热前 N 张缩略图（图片优先，体积大优先），剩余靠懒加载"""
+    time.sleep(2)  # 等服务先起来再占 CPU
+    # 图片排前面：视频抽帧慢，先出图片用户更早看到效果
+    items = sorted(media_list, key=lambda m: (m["is_video"], -m["size"]))
+    done = 0
+    for m in items[:limit]:
+        thumb = THUMBS / (m["rel"] + ".jpg")
+        if thumb.exists():
+            continue
+        with thumb_sem:
+            ensure_thumb(m["rel"], m["is_video"])
+        done += 1
+        if done % 50 == 0:
+            print(f"  预生成缩略图 {done}...")
+    print(f"  预热完成 {done} 个（其余按需生成）")
 
+
+# ── 文件操作 ──────────────────────────────────────────────
+def do_delete(rel):
+    """把一个文件移到回收站，成功返回 True
+
+    重试最多 5 次（应对文件被播放器占用），缩略图一并清理。
+    """
+    root, local = resolve_rel(rel)
+    if root is None:
+        return False
+    src = root / local
+    if not src.exists():
+        return False
+    trash_path = TRASH / rel
+    trash_path.parent.mkdir(parents=True, exist_ok=True)
+    for i in range(5):
+        try:
+            shutil.move(str(src), str(trash_path))
+            break
+        except OSError:
+            if i < 4:
+                time.sleep(0.5)
+            else:
+                return False
+    thumb = THUMBS / (rel + ".jpg")
+    if thumb.exists():
+        thumb.unlink()
+    return True
+
+
+# ── HTTP 请求处理 ─────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
+    """纯本地 HTTP 服务，只绑定 127.0.0.1"""
+
+    def log_message(self, fmt, *args):
+        pass  # 关掉默认访问日志
+
+    def handle(self):
+        """吞掉浏览器关连接时的异常，不刷屏"""
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
+
+    # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
         path = urllib.parse.unquote(self.path.split("?")[0])
         if path in ("/", "/index.html"):
@@ -208,9 +286,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"count": len(media_list)})
         elif path == "/api/config":
             self.handle_config_save()
+        elif path == "/api/browse":
+            self.handle_browse()
+        elif path == "/api/reveal":
+            self.handle_reveal()
+        elif path == "/api/open":
+            self.handle_open()
         else:
             self.send_error(404)
 
+    # ── 响应工具 ──────────────────────────────────────────
     def send_json(self, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -228,11 +313,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def read_body(self):
+        """读取 POST body 并解析 JSON"""
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length))
+
+    # ── API 处理 ──────────────────────────────────────────
     def handle_config_save(self):
+        """保存订阅目录列表并重新扫描"""
         global media_list, config
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self.read_body()
             dirs = body.get("dirs", [])
             if not isinstance(dirs, list):
                 raise ValueError("dirs 必须是数组")
@@ -246,6 +337,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"ok": True, "count": len(media_list)})
 
     def handle_thumb(self, rel):
+        """返回缩略图，不存在则现场生成"""
         is_video = any(m["rel"] == rel and m["is_video"] for m in media_list)
         with thumb_sem:
             thumb = ensure_thumb(rel, is_video)
@@ -255,6 +347,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def handle_media(self, rel):
+        """返回原始媒体文件，支持 HTTP Range（视频拖拽进度条）"""
         root, local = resolve_rel(rel)
         if root is None:
             self.send_error(404)
@@ -265,36 +358,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         mime = MIME_MAP.get(fp.suffix.lower(), "application/octet-stream")
         fsize = fp.stat().st_size
+
         range_hdr = self.headers.get("Range", "")
-        if range_hdr.startswith("bytes="):
-            spec = range_hdr[6:].split(",")[0]
-            if "-" in spec:
-                s, e = spec.split("-", 1)
-                start = int(s) if s else max(0, fsize - int(e))
-                end = min(int(e), fsize - 1) if e else fsize - 1
-            else:
-                start, end = int(spec), fsize - 1
-            start = min(start, fsize - 1)
-            if start > end:
-                self.send_error(416)
-                return
-            length = end - start + 1
-            self.send_response(206)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Range", f"bytes {start}-{end}/{fsize}")
-            self.send_header("Content-Length", str(length))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-            with open(fp, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        else:
+        if not range_hdr.startswith("bytes="):
+            # 整文件传输
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(fsize))
@@ -306,79 +373,114 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+            return
+
+        # Range: bytes=start-end / bytes=start- / bytes=-suffix
+        spec = range_hdr[6:].split(",")[0]
+        if "-" in spec:
+            s, e = spec.split("-", 1)
+            start = int(s) if s else max(0, fsize - int(e))
+            end = min(int(e), fsize - 1) if e else fsize - 1
+        else:
+            start, end = int(spec), fsize - 1
+        start = min(start, fsize - 1)
+        if start > end:
+            self.send_error(416)
+            return
+        length = end - start + 1
+        self.send_response(206)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Range", f"bytes {start}-{end}/{fsize}")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        with open(fp, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def handle_delete(self, rel):
-        root, local = resolve_rel(rel)
-        if root is None:
-            self.send_json({"ok": False, "error": "无效路径"})
+        """删除单个文件（移到回收站）"""
+        if not do_delete(rel):
+            self.send_json({"ok": False, "error": "文件不存在或被占用"})
             return
-        src = root / local
-        if not src.exists():
-            self.send_json({"ok": False, "error": "文件不存在"})
-            return
-        trash_path = TRASH / rel
-        trash_path.parent.mkdir(parents=True, exist_ok=True)
-        for i in range(5):
-            try:
-                shutil.move(str(src), str(trash_path))
-                break
-            except OSError:
-                if i < 4:
-                    time.sleep(0.5)
-                else:
-                    self.send_json({"ok": False, "error": "文件被占用,请关闭播放器后重试"})
-                    return
-        thumb = THUMBS / (rel + ".jpg")
-        if thumb.exists():
-            thumb.unlink()
         with media_lock:
             media_list[:] = [m for m in media_list if m["rel"] != rel]
         self.send_json({"ok": True})
 
     def handle_batch_delete(self):
+        """批量删除（移到回收站）"""
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self.read_body()
             rels = body.get("rels", [])
         except Exception:
             self.send_error(400)
             return
         deleted = []
         for rel in rels:
-            root, local = resolve_rel(rel)
-            if root is None:
-                continue
-            src = root / local
-            if not src.exists():
-                continue
-            trash_path = TRASH / rel
-            trash_path.parent.mkdir(parents=True, exist_ok=True)
-            moved = False
-            for i in range(3):
-                try:
-                    shutil.move(str(src), str(trash_path))
-                    moved = True
-                    break
-                except OSError:
-                    if i < 2:
-                        time.sleep(0.3)
-            if not moved:
-                continue
-            thumb = THUMBS / (rel + ".jpg")
-            if thumb.exists():
-                thumb.unlink()
-            deleted.append(rel)
+            if do_delete(rel):
+                deleted.append(rel)
         with media_lock:
             media_list[:] = [m for m in media_list if m["rel"] not in set(deleted)]
         self.send_json({"ok": True, "deleted": len(deleted)})
 
+    def handle_reveal(self):
+        """在资源管理器中定位文件"""
+        try:
+            body = self.read_body()
+            root, local = resolve_rel(body.get("rel", ""))
+            if root is None:
+                self.send_json({"ok": False, "error": "无效路径"})
+                return
+            subprocess.Popen(["explorer", "/select,", str(root / local)])
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
 
+    def handle_open(self):
+        """用系统默认播放器打开文件"""
+        try:
+            body = self.read_body()
+            root, local = resolve_rel(body.get("rel", ""))
+            if root is None:
+                self.send_json({"ok": False, "error": "无效路径"})
+                return
+            os.startfile(str(root / local))
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
+
+    def handle_browse(self):
+        """弹出 Windows 原生文件夹选择对话框"""
+        try:
+            ps = (
+                'Add-Type -AssemblyName System.Windows.Forms; '
+                '$d = New-Object System.Windows.Forms.FolderBrowserDialog; '
+                '$d.Description = "选择相册目录"; '
+                'if($d.ShowDialog() -eq "OK"){ $d.SelectedPath }'
+            )
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.send_json({"ok": bool(r.stdout.strip()), "path": r.stdout.strip()})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
+
+
+# ── 前端页面 ──────────────────────────────────────────────
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>相册管理器</title>
+<title>小象相册</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐘</text></svg>">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
@@ -431,7 +533,6 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
 .cleanmode .cbar{margin-top:12px;color:#aaa;font-size:14px;display:flex;gap:18px;align-items:center}
 .cleanmode .cbar b{color:#fff}
 .cleanmode .key{background:#333;padding:2px 10px;border-radius:4px;font-size:12px;color:#ccc}
-#selrect{display:none;position:fixed;border:1.5px solid #0066cc;background:rgba(0,102,204,.12);pointer-events:none;z-index:99}
 .settings{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:250;align-items:center;justify-content:center}
 .settings.show{display:flex}
 .settings .panel{background:#2a2a2a;border-radius:12px;padding:24px;width:min(640px,92vw);max-height:86vh;overflow:auto}
@@ -451,28 +552,36 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
 .settings .foot .close{background:#333;color:#ccc}
 .empty{padding:80px 20px;text-align:center;color:#666}
 .empty h3{color:#aaa;margin-bottom:12px}
+.spin{display:inline-block;width:16px;height:16px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:rot .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes rot{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
+<!-- 工具栏 -->
 <div class="toolbar">
+  <span style="font-size:16px;font-weight:bold;color:#fff;margin-right:8px">🐘 小象相册</span>
+  <a href="https://github.com/dearmouseuncle" target="_blank" style="font-size:12px;color:#4a9eff;margin-right:12px;text-decoration:none">by dearmouseuncle</a>
   <button onclick="setSort('date')" id="btn-date">按时间</button>
   <button onclick="setSort('size')" id="btn-size">按大小</button>
   <button onclick="setSort('name')" id="btn-name">按名称</button>
-  <button onclick="toggleDir()" id="btn-dir">↓</button>
+  <button onclick="toggleDir()" id="btn-dir">倒序</button>
   <button onclick="doRefresh()">刷新</button>
   <button onclick="enterClean()" style="background:#2a5a2a;border-color:#3a7a3a;color:#8f8">快速清理</button>
   <button onclick="toggleSelectAll()" id="btn-selall">全选</button>
   <button onclick="openSettings()" style="background:#1a3a5a;border-color:#2a5a8a;color:#8cf">设置</button>
   <span class="stats" id="stats">加载中...</span>
 </div>
+<!-- 筛选栏：类型 + 年月 -->
 <div class="filterbar" id="filterbar"></div>
-<div id="selrect"></div>
+<!-- 瀑布流网格 -->
 <div class="grid" id="grid"><div class="loading">加载中...</div></div>
+<!-- 多选操作栏 -->
 <div class="selbar" id="selbar">
   <span class="cnt" id="selcnt"></span>
   <button class="del" onclick="deleteSelected()">删除选中</button>
   <button class="cancel" onclick="clearSelect()">取消</button>
 </div>
+<!-- 光箱：大图/视频预览 -->
 <div class="lightbox" id="lightbox" onclick="if(event.target===this)closeLB()">
   <div id="lb-content"></div>
   <div class="info" id="lb-info"></div>
@@ -481,9 +590,13 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
     <button class="btn-del" onclick="deleteCurrent()">删除</button>
     <button class="btn-nav" onclick="nav(1)">下一个 →</button>
     <button class="btn-nav" onclick="enterClean(curIdx);closeLB()">快速清理</button>
+    <button class="btn-nav" onclick="revealFile()">打开目录</button>
+    <button class="btn-nav" onclick="copyName()">复制文件名</button>
+    <button class="btn-nav" onclick="externalPlay()" style="background:#5a3a1a;border-color:#7a5a2a;color:#fc8">外部播放</button>
     <button class="btn-nav" onclick="closeLB()">关闭</button>
   </div>
 </div>
+<!-- 设置：订阅目录管理 -->
 <div class="settings" id="settings" onclick="if(event.target===this)closeSettings()">
   <div class="panel">
     <h2>订阅目录设置</h2>
@@ -491,6 +604,7 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
     <div id="dirlist"></div>
     <div class="addrow">
       <input id="dirinput" placeholder="例如 D:\Photos 或 \\\\NAS\\share\\photos" />
+      <button onclick="browseDir()">选择文件夹</button>
       <button onclick="addDir()">添加</button>
     </div>
     <div class="foot">
@@ -499,6 +613,7 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
     </div>
   </div>
 </div>
+<!-- 快速清理：全屏逐张审阅 -->
 <div class="cleanmode" id="cleanmode">
   <div id="cm-content"></div>
   <div class="cbar">
@@ -507,16 +622,21 @@ body{font-family:'Microsoft YaHei',sans-serif;background:#1a1a1a;color:#e0e0e0}
   </div>
 </div>
 <script>
+// ── 状态 ──────────────────────────────────────────────────
 let media=[],sortKey='size',sortDir=-1,curIdx=-1,sorted=[],selected=new Set(),shown=0;
 let filterYear=0,filterMonth=0,filterType='';
 let cfgDirs=[];
-const PAGE=200;
+const PAGE=200;  // 每批渲染数量，配合无限滚动
+
+// ── 数据加载 ──────────────────────────────────────────────
 async function loadMedia(){
   const r=await fetch('/api/media');
   media=await r.json();
   buildFilter();
   render();
 }
+
+// ── 筛选栏 ────────────────────────────────────────────────
 function buildFilter(){
   const years=[...new Set(media.map(m=>m.year))].sort();
   let html='<button class="fbtn'+(filterType===''?' active':'')+'" onclick="setType(0)">全部</button>'+
@@ -538,8 +658,12 @@ function buildFilter(){
 }
 function setType(t){filterType=t===1?'img':t===2?'vid':'';buildFilter();render();}
 function setFilter(y,m){filterYear=y;filterMonth=m;buildFilter();render();}
+
+// ── 排序 ──────────────────────────────────────────────────
 function setSort(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}render();}
 function toggleDir(){sortDir*=-1;render();}
+
+// ── 渲染 ──────────────────────────────────────────────────
 function render(){
   let list=media;
   if(filterType==='img')list=list.filter(m=>!m.is_video);
@@ -556,7 +680,7 @@ function render(){
   ['date','size','name'].forEach(k=>{
     document.getElementById('btn-'+k).classList.toggle('active',sortKey===k);
   });
-  document.getElementById('btn-dir').textContent=sortDir===-1?'↓':'↑';
+  document.getElementById('btn-dir').textContent=sortDir===-1?'倒序':'正序';
   const total=sorted.reduce((s,m)=>s+m.size,0);
   document.getElementById('stats').textContent=sorted.length+' 个文件 · '+fmt(total);
   document.getElementById('grid').innerHTML='';
@@ -569,6 +693,8 @@ function render(){
   }
   appendBatch();
 }
+
+// 分批渲染，配合滚动到底自动加载
 function appendBatch(){
   const end=Math.min(shown+PAGE,sorted.length);
   if(shown>=end)return;
@@ -588,6 +714,8 @@ function appendBatch(){
   shown=end;
   updateSelBar();
 }
+
+// ── 光箱 ──────────────────────────────────────────────────
 function openLB(i){
   curIdx=i;
   const m=sorted[i];
@@ -612,10 +740,29 @@ function nav(d){
   const n=curIdx+d;
   if(n>=0&&n<sorted.length)openLB(n);
 }
+
+// ── 光箱操作 ──────────────────────────────────────────────
+async function revealFile(){
+  if(curIdx<0)return;
+  await fetch('/api/reveal',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({rel:sorted[curIdx].rel})});
+}
+function copyName(){
+  if(curIdx<0)return;
+  navigator.clipboard.writeText(sorted[curIdx].name).then(()=>{});
+}
+async function externalPlay(){
+  if(curIdx<0)return;
+  await fetch('/api/open',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({rel:sorted[curIdx].rel})});
+}
 async function deleteCurrent(){
   if(curIdx<0)return;
   const m=sorted[curIdx];
   if(!confirm('删除 '+m.name+'？\n'+fmt(m.size)+'\n\n(移到回收站，可恢复)'))return;
+  // 先停视频释放文件锁，否则 Windows 不让移动
   const v=document.querySelector('#lb-content video');
   if(v){v.pause();v.removeAttribute('src');v.load();}
   await new Promise(r=>setTimeout(r,150));
@@ -631,6 +778,8 @@ async function doRefresh(){
   await fetch('/api/refresh',{method:'POST'});
   await loadMedia();
 }
+
+// ── 多选 ──────────────────────────────────────────────────
 function toggleSelect(idx){
   const m=sorted[idx];if(!m)return;
   if(selected.has(m.rel))selected.delete(m.rel);else selected.add(m.rel);
@@ -682,13 +831,13 @@ async function deleteSelected(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({rels:[...selected]})});
   if(r.ok){
-    const d=await r.json();
     media=media.filter(x=>!selected.has(x.rel));
     selected.clear();
     render();
   }else alert('删除失败');
 }
-// 快速清理模式
+
+// ── 快速清理模式 ──────────────────────────────────────────
 let cmIdx=-1,cmList=[];
 function enterClean(startIdx){
   cmList=[...sorted];cmIdx=startIdx||0;
@@ -726,7 +875,8 @@ async function cmDelete(){
   cmList.splice(cmIdx,1);
   cmShow();
 }
-// 设置：订阅目录
+
+// ── 设置面板 ──────────────────────────────────────────────
 async function openSettings(){
   try{
     const r=await fetch('/api/config');
@@ -749,6 +899,14 @@ function renderDirs(){
     '<button onclick="removeDir('+i+')">移除</button></div>'
   ).join('');
 }
+async function browseDir(){
+  const r=await fetch('/api/browse',{method:'POST'});
+  const d=await r.json();
+  if(d.ok&&d.path){
+    document.getElementById('dirinput').value=d.path;
+    addDir();
+  }
+}
 function addDir(){
   const inp=document.getElementById('dirinput');
   const v=inp.value.trim();
@@ -760,25 +918,36 @@ function addDir(){
 }
 function removeDir(i){cfgDirs.splice(i,1);renderDirs();}
 async function saveSettings(){
-  const r=await fetch('/api/config',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({dirs:cfgDirs})});
-  const d=await r.json();
-  if(!d.ok){alert(d.error||'保存失败');return;}
-  closeSettings();
-  await loadMedia();
+  const btn=document.querySelector('.settings .save');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span>扫描中...';
+  try{
+    const r=await fetch('/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dirs:cfgDirs})});
+    const d=await r.json();
+    if(!d.ok){alert(d.error||'保存失败');return;}
+    closeSettings();
+    await loadMedia();
+  }finally{
+    btn.disabled=false;btn.textContent='保存并扫描';
+  }
 }
+
+// ── 键盘快捷键 ────────────────────────────────────────────
 document.addEventListener('keydown',e=>{
+  // 快速清理模式
   if(document.getElementById('cleanmode').classList.contains('show')){
     if(e.key==='ArrowUp'){e.preventDefault();cmDelete();}
     else if(e.key==='ArrowDown'){e.preventDefault();cmIdx++;cmShow();}
     else if(e.key==='Escape')closeClean();
     return;
   }
+  // 设置面板
   if(document.getElementById('settings').classList.contains('show')){
     if(e.key==='Escape')closeSettings();
     return;
   }
+  // 光箱
   if(e.key==='Escape')closeLB();
   else if(e.key==='ArrowLeft')nav(-1);
   else if(e.key==='ArrowRight')nav(1);
@@ -787,6 +956,8 @@ document.addEventListener('keydown',e=>{
     else if(selected.size>0)deleteSelected();
   }
 });
+
+// ── 工具函数 ──────────────────────────────────────────────
 function fmt(b){
   if(b<1024)return b+' B';
   if(b<1048576)return(b/1024).toFixed(1)+' KB';
@@ -795,58 +966,48 @@ function fmt(b){
 }
 function enc(s){return encodeURIComponent(s);}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+// ── 无限滚动 ──────────────────────────────────────────────
 window.addEventListener('scroll',()=>{
   if(shown<sorted.length&&window.innerHeight+window.scrollY>=document.body.offsetHeight-600)appendBatch();
 });
-let dragging=false,dragX0=0,dragY0=0;
+
+// ── 划过选择（按住鼠标拖过即选中）──────────────────────────
+let paint=false;
 document.getElementById('grid').addEventListener('mousedown',e=>{
   if(e.button!==0)return;
-  if(e.target.closest('.card'))return;
-  dragging=true;dragX0=e.clientX;dragY0=e.clientY;
-  const r=document.getElementById('selrect');
-  r.style.display='block';r.style.left=dragX0+'px';r.style.top=dragY0+'px';r.style.width='0';r.style.height='0';
+  paint=true;
   e.preventDefault();
 });
 document.addEventListener('mousemove',e=>{
-  if(!dragging)return;
-  const r=document.getElementById('selrect');
-  const x=Math.min(dragX0,e.clientX),y=Math.min(dragY0,e.clientY);
-  const w=Math.abs(e.clientX-dragX0),h=Math.abs(e.clientY-dragY0);
-  r.style.left=x+'px';r.style.top=y+'px';r.style.width=w+'px';r.style.height=h+'px';
-  const rect={left:x,top:y,right:x+w,bottom:y+h};
-  document.querySelectorAll('.card').forEach(card=>{
-    const cr=card.getBoundingClientRect();
-    const hit=!(cr.right<rect.left||cr.left>rect.right||cr.bottom<rect.top||cr.top>rect.bottom);
-    if(hit){
-      const idx=+card.dataset.idx;const m=sorted[idx];if(!m)return;
-      if(!selected.has(m.rel)){
-        selected.add(m.rel);
-        card.classList.add('sel');
-        const chk=card.querySelector('.chk');
-        if(chk){chk.classList.add('on');chk.textContent='✓';}
-      }
+  if(!paint)return;
+  const el=document.elementFromPoint(e.clientX,e.clientY);
+  const card=el&&el.closest?el.closest('.card'):null;
+  if(card){
+    const idx=+card.dataset.idx;const m=sorted[idx];if(!m)return;
+    if(!selected.has(m.rel)){
+      selected.add(m.rel);
+      card.classList.add('sel');
+      const chk=card.querySelector('.chk');
+      if(chk){chk.classList.add('on');chk.textContent='✓';}
+      updateSelBar();
     }
-  });
-  updateSelBar();
+  }
 });
-document.addEventListener('mouseup',()=>{
-  if(!dragging)return;
-  dragging=false;
-  document.getElementById('selrect').style.display='none';
-});
+document.addEventListener('mouseup',()=>{paint=false;});
+
+// 启动
 loadMedia();
 </script>
 </body>
 </html>"""
 
 
+# ── 启动 ──────────────────────────────────────────────────
 def main():
     global media_list
     THUMBS.mkdir(parents=True, exist_ok=True)
     TRASH.mkdir(parents=True, exist_ok=True)
-
-    pid_file = DATA / "album.pid"
-    pid_file.write_text(str(os.getpid()), encoding="utf-8")
 
     dirs = config.get("dirs", [])
     if dirs:
@@ -859,18 +1020,29 @@ def main():
         print("还没有订阅目录，请在网页「设置」里添加")
         media_list = []
 
+    # 启动 HTTP 服务
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://127.0.0.1:{PORT}"
-    print(f"相册管理器: {url}")
+    print(f"小象相册: {url}")
     print("快捷键: ←→ 翻页 | Delete 删除 | Esc 关闭")
-    webbrowser.open(url)
+    print("关闭程序: 按 Ctrl+C，或直接关掉本窗口")
+
+    # 等服务就绪再开浏览器，避免白屏
+    def open_when_ready():
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(url, timeout=1)
+                break
+            except Exception:
+                time.sleep(0.3)
+        webbrowser.open(url)
+
+    threading.Thread(target=open_when_ready, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n退出")
-    finally:
-        pid_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

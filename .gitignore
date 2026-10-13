@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.spec
 config.json
 thumbs/
 trash/
@@ -7,5 +8,8 @@ album.pid
 dupes.json
 dist/
 build/
-*.spec
 _test/
+del_broken.py
+delete_dupes.py
+find_dupes.py
+find_qr.py
